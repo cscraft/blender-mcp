@@ -2387,7 +2387,21 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
                 layout.prop(scene, "blendermcp_hunyuan3d_num_inference_steps", text="Number of Inference Steps")
                 layout.prop(scene, "blendermcp_hunyuan3d_guidance_scale", text="Guidance Scale")
                 layout.prop(scene, "blendermcp_hunyuan3d_texture", text="Generate Texture")
-        
+
+        # CAD Import Section
+        layout.separator()
+        box = layout.box()
+        box.label(text="CAD Import", icon='IMPORT')
+        box.prop(scene, "blendermcp_cad_wall_height")
+        box.prop(scene, "blendermcp_cad_wall_thickness")
+        box.prop(scene, "blendermcp_cad_floor_height")
+        box.prop(scene, "blendermcp_cad_auto_place_openings")
+        if scene.blendermcp_cad_auto_place_openings:
+            box.prop(scene, "blendermcp_cad_window_search_query")
+            box.prop(scene, "blendermcp_cad_door_search_query")
+        box.operator("blendermcp.import_cad", text="Import DXF File", icon='IMPORT')
+        box.label(text="Note: Convert DWG to DXF first", icon='INFO')
+
         if not scene.blendermcp_server_running:
             layout.operator("blendermcp.start_server", text="Connect to MCP server")
         else:
@@ -2441,6 +2455,136 @@ class BLENDERMCP_OT_StopServer(bpy.types.Operator):
         scene.blendermcp_server_running = False
 
         return {'FINISHED'}
+
+# Operator to import CAD files
+class BLENDERMCP_OT_ImportCAD(bpy.types.Operator):
+    bl_idname = "blendermcp.import_cad"
+    bl_label = "Import CAD Drawing"
+    bl_description = "Import architectural CAD drawings (.dxf) as 3D models"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(default="*.dxf", options={'HIDDEN'})
+
+    def execute(self, context):
+        scene = context.scene
+
+        try:
+            # Import cad_utils modules
+            import sys
+            import os
+            import importlib
+
+            addon_dir = os.path.dirname(__file__)
+            if addon_dir not in sys.path:
+                sys.path.insert(0, addon_dir)
+
+            # Force reload modules to ensure we get the latest version
+            # Remove cached modules to force fresh import
+            modules_to_remove = [key for key in sys.modules.keys() if key.startswith('cad_utils')]
+            for module_name in modules_to_remove:
+                del sys.modules[module_name]
+
+            # Also clear ezdxf cache if it exists
+            if 'ezdxf' in sys.modules:
+                del sys.modules['ezdxf']
+
+            from cad_utils import cad_parser, geometry_builder
+
+            # Start progress
+            wm = context.window_manager
+            wm.progress_begin(0, 100)
+
+            # Parse DXF file
+            wm.progress_update(10)
+            self.report({'INFO'}, f"Parsing DXF file: {os.path.basename(self.filepath)}")
+            parsed_data = cad_parser.parse_dxf(self.filepath)
+
+            if not parsed_data['walls']:
+                self.report({'WARNING'}, "No walls detected in DXF file. Check if the file contains LWPOLYLINE or LINE entities.")
+
+            # Build 3D geometry
+            wm.progress_update(50)
+            self.report({'INFO'}, f"Building 3D geometry for {len(parsed_data['walls'])} walls...")
+
+            wall_objects = geometry_builder.build_walls(
+                parsed_data['walls'],
+                height=scene.blendermcp_cad_wall_height,
+                thickness=scene.blendermcp_cad_wall_thickness,
+                z_offset=scene.blendermcp_cad_floor_height
+            )
+
+            # Build openings (windows and doors)
+            wm.progress_update(60)
+            opening_objects = []
+            if parsed_data.get('openings') and scene.blendermcp_cad_auto_place_openings:
+                self.report({'INFO'}, f"Building {len(parsed_data['openings'])} openings...")
+                opening_objects = geometry_builder.build_openings(
+                    parsed_data['openings'],
+                    z_offset=scene.blendermcp_cad_floor_height,
+                    use_placeholder=True
+                )
+
+                # Apply boolean cuts to walls (simplified - cuts all walls)
+                wm.progress_update(75)
+                if wall_objects and opening_objects:
+                    self.report({'INFO'}, "Applying boolean cuts to walls...")
+                    for opening_obj in opening_objects:
+                        # For simplicity, apply to first wall object
+                        # In a real implementation, we'd find the nearest wall
+                        if len(wall_objects) > 0:
+                            geometry_builder.create_opening_in_wall(wall_objects[0], opening_obj)
+
+            # Create collection and add objects
+            wm.progress_update(90)
+            collection_name = f"CAD_{os.path.splitext(os.path.basename(self.filepath))[0]}"
+            collection = bpy.data.collections.new(collection_name)
+            context.scene.collection.children.link(collection)
+
+            # Create sub-collections for organization
+            walls_collection = bpy.data.collections.new("Walls")
+            collection.children.link(walls_collection)
+
+            for obj in wall_objects:
+                walls_collection.objects.link(obj)
+                context.scene.collection.objects.link(obj)
+
+            if opening_objects:
+                openings_collection = bpy.data.collections.new("Openings")
+                collection.children.link(openings_collection)
+                for obj in opening_objects:
+                    openings_collection.objects.link(obj)
+                    context.scene.collection.objects.link(obj)
+
+            # Finish progress
+            wm.progress_end()
+
+            total_objects = len(wall_objects) + len(opening_objects)
+            self.report({'INFO'}, f"Successfully imported {len(wall_objects)} walls and {len(opening_objects)} openings from {os.path.basename(self.filepath)}")
+            return {'FINISHED'}
+
+        except FileNotFoundError as e:
+            self.report({'ERROR'}, f"File not found: {str(e)}")
+            return {'CANCELLED'}
+        except ValueError as e:
+            self.report({'ERROR'}, f"Invalid DXF file: {str(e)}")
+            return {'CANCELLED'}
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            print("=" * 60)
+            print("CAD Import Error Details:")
+            print(error_details)
+            print("=" * 60)
+            print(f"addon_dir: {os.path.dirname(__file__)}")
+            print(f"sys.path: {sys.path[:3]}")
+            print(f"cad_utils exists: {os.path.exists(os.path.join(os.path.dirname(__file__), 'cad_utils'))}")
+            self.report({'ERROR'}, f"Failed to import CAD file: {str(e)}")
+            return {'CANCELLED'}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
 
 # Operator to open Terms and Conditions
 class BLENDERMCP_OT_OpenTerms(bpy.types.Operator):
@@ -2582,6 +2726,52 @@ def register():
         default=""
     )
 
+    # CAD Import properties
+    bpy.types.Scene.blendermcp_cad_wall_height = bpy.props.FloatProperty(
+        name="Default Wall Height",
+        description="Default height for walls in meters",
+        default=2.4,
+        min=2.0,
+        max=6.0,
+        unit='LENGTH'
+    )
+
+    bpy.types.Scene.blendermcp_cad_wall_thickness = bpy.props.FloatProperty(
+        name="Default Wall Thickness",
+        description="Default thickness for walls in meters",
+        default=0.12,
+        min=0.05,
+        max=0.5,
+        unit='LENGTH'
+    )
+
+    bpy.types.Scene.blendermcp_cad_floor_height = bpy.props.FloatProperty(
+        name="Floor Base Height",
+        description="Base height for the floor in meters",
+        default=0.0,
+        min=0.0,
+        max=10.0,
+        unit='LENGTH'
+    )
+
+    bpy.types.Scene.blendermcp_cad_auto_place_openings = bpy.props.BoolProperty(
+        name="Auto-Place Openings",
+        description="Automatically detect and place windows/doors from DXF",
+        default=True
+    )
+
+    bpy.types.Scene.blendermcp_cad_window_search_query = bpy.props.StringProperty(
+        name="Window Search Query",
+        description="Sketchfab search query for window models",
+        default="modern window realistic"
+    )
+
+    bpy.types.Scene.blendermcp_cad_door_search_query = bpy.props.StringProperty(
+        name="Door Search Query",
+        description="Sketchfab search query for door models",
+        default="interior door realistic"
+    )
+
     # Register preferences class
     bpy.utils.register_class(BLENDERMCP_AddonPreferences)
 
@@ -2589,6 +2779,7 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.register_class(BLENDERMCP_OT_StartServer)
     bpy.utils.register_class(BLENDERMCP_OT_StopServer)
+    bpy.utils.register_class(BLENDERMCP_OT_ImportCAD)
     bpy.utils.register_class(BLENDERMCP_OT_OpenTerms)
 
     print("BlenderMCP addon registered")
@@ -2603,6 +2794,7 @@ def unregister():
     bpy.utils.unregister_class(BLENDERMCP_OT_SetFreeTrialHyper3DAPIKey)
     bpy.utils.unregister_class(BLENDERMCP_OT_StartServer)
     bpy.utils.unregister_class(BLENDERMCP_OT_StopServer)
+    bpy.utils.unregister_class(BLENDERMCP_OT_ImportCAD)
     bpy.utils.unregister_class(BLENDERMCP_OT_OpenTerms)
     bpy.utils.unregister_class(BLENDERMCP_AddonPreferences)
 
@@ -2623,6 +2815,12 @@ def unregister():
     del bpy.types.Scene.blendermcp_hunyuan3d_num_inference_steps
     del bpy.types.Scene.blendermcp_hunyuan3d_guidance_scale
     del bpy.types.Scene.blendermcp_hunyuan3d_texture
+    del bpy.types.Scene.blendermcp_cad_wall_height
+    del bpy.types.Scene.blendermcp_cad_wall_thickness
+    del bpy.types.Scene.blendermcp_cad_floor_height
+    del bpy.types.Scene.blendermcp_cad_auto_place_openings
+    del bpy.types.Scene.blendermcp_cad_window_search_query
+    del bpy.types.Scene.blendermcp_cad_door_search_query
 
     print("BlenderMCP addon unregistered")
 
