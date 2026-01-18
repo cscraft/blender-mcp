@@ -2392,6 +2392,7 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
         layout.separator()
         box = layout.box()
         box.label(text="CAD Import", icon='IMPORT')
+        box.prop(scene, "blendermcp_cad_import_scale")
         box.prop(scene, "blendermcp_cad_wall_height")
         box.prop(scene, "blendermcp_cad_wall_thickness")
         box.prop(scene, "blendermcp_cad_floor_height")
@@ -2400,6 +2401,7 @@ class BLENDERMCP_PT_Panel(bpy.types.Panel):
             box.prop(scene, "blendermcp_cad_window_search_query")
             box.prop(scene, "blendermcp_cad_door_search_query")
         box.operator("blendermcp.import_cad", text="Import DXF File", icon='IMPORT')
+        box.operator("blendermcp.import_json_3d", text="Import JSON as 3D", icon='FILE_3D')
         box.label(text="Note: Convert DWG to DXF first", icon='INFO')
 
         if not scene.blendermcp_server_running:
@@ -2497,8 +2499,30 @@ class BLENDERMCP_OT_ImportCAD(bpy.types.Operator):
 
             # Parse DXF file
             wm.progress_update(10)
-            self.report({'INFO'}, f"Parsing DXF file: {os.path.basename(self.filepath)}")
-            parsed_data = cad_parser.parse_dxf(self.filepath)
+            import_scale = scene.blendermcp_cad_import_scale
+            self.report({'INFO'}, f"Parsing DXF file: {os.path.basename(self.filepath)} (scale: {import_scale})")
+
+            # Parse to old format (for backward compatibility)
+            parsed_data = cad_parser.parse_dxf(self.filepath, user_scale=import_scale)
+
+            # Also generate building elements JSON
+            wm.progress_update(15)
+            wall_height = scene.blendermcp_cad_wall_height
+            building_elements = cad_parser.parse_dxf_to_elements(
+                self.filepath,
+                user_scale=import_scale,
+                wall_height=wall_height
+            )
+
+            # Save JSON to data directory
+            import_dir = os.path.dirname(os.path.abspath(__file__))
+            data_dir = os.path.join(import_dir, 'data')
+            os.makedirs(data_dir, exist_ok=True)
+
+            base_name = os.path.splitext(os.path.basename(self.filepath))[0]
+            json_path = os.path.join(data_dir, f"{base_name}_elements.json")
+            cad_parser.save_elements_json(building_elements, json_path)
+            self.report({'INFO'}, f"Saved building elements JSON: {os.path.basename(json_path)}")
 
             if not parsed_data['walls']:
                 self.report({'WARNING'}, "No walls detected in DXF file. Check if the file contains LWPOLYLINE or LINE entities.")
@@ -2585,6 +2609,81 @@ class BLENDERMCP_OT_ImportCAD(bpy.types.Operator):
     def invoke(self, context, event):
         context.window_manager.fileselect_add(self)
         return {'RUNNING_MODAL'}
+
+
+class BLENDERMCP_OT_ImportJSON3D(bpy.types.Operator):
+    """Import 3D geometry from building elements JSON file"""
+    bl_idname = "blendermcp.import_json_3d"
+    bl_label = "Import JSON as 3D"
+    bl_description = "Import building elements from JSON file and generate 3D geometry"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(default="*.json", options={'HIDDEN'})
+
+    def execute(self, context):
+        try:
+            # Import modules
+            import sys
+            import os
+
+            addon_dir = os.path.dirname(__file__)
+            if addon_dir not in sys.path:
+                sys.path.insert(0, addon_dir)
+
+            # Force reload modules
+            modules_to_remove = [key for key in sys.modules.keys() if key.startswith('cad_utils')]
+            for module_name in modules_to_remove:
+                del sys.modules[module_name]
+
+            from cad_utils import geometry_builder
+
+            # Start progress
+            wm = context.window_manager
+            wm.progress_begin(0, 100)
+
+            # Build scene from JSON
+            wm.progress_update(10)
+            base_name = os.path.splitext(os.path.basename(self.filepath))[0]
+            collection_name = f"CAD_{base_name}"
+
+            self.report({'INFO'}, f"Building 3D scene from JSON: {os.path.basename(self.filepath)}")
+
+            wm.progress_update(30)
+            created_objects = geometry_builder.build_scene_from_json(
+                self.filepath,
+                collection_name=collection_name
+            )
+
+            wm.progress_end()
+
+            # Report success
+            total_walls = len(created_objects.get('walls', []))
+            total_floors = len(created_objects.get('floors', []))
+            total_openings = len(created_objects.get('openings', []))
+
+            self.report({'INFO'},
+                f"Successfully created: {total_walls} walls, {total_floors} floors, {total_openings} openings")
+
+            return {'FINISHED'}
+
+        except FileNotFoundError as e:
+            self.report({'ERROR'}, f"File not found: {str(e)}")
+            return {'CANCELLED'}
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            print("=" * 60)
+            print("JSON 3D Import Error Details:")
+            print(error_details)
+            print("=" * 60)
+            self.report({'ERROR'}, f"Failed to import JSON: {str(e)}")
+            return {'CANCELLED'}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
 
 # Operator to open Terms and Conditions
 class BLENDERMCP_OT_OpenTerms(bpy.types.Operator):
@@ -2772,6 +2871,14 @@ def register():
         default="interior door realistic"
     )
 
+    bpy.types.Scene.blendermcp_cad_import_scale = bpy.props.FloatProperty(
+        name="Import Scale",
+        description="Scale factor for DXF import (e.g., 0.1 to make 10x smaller, 1.0 for no scaling)",
+        default=1.0,
+        min=0.001,
+        max=1000.0
+    )
+
     # Register preferences class
     bpy.utils.register_class(BLENDERMCP_AddonPreferences)
 
@@ -2780,6 +2887,7 @@ def register():
     bpy.utils.register_class(BLENDERMCP_OT_StartServer)
     bpy.utils.register_class(BLENDERMCP_OT_StopServer)
     bpy.utils.register_class(BLENDERMCP_OT_ImportCAD)
+    bpy.utils.register_class(BLENDERMCP_OT_ImportJSON3D)
     bpy.utils.register_class(BLENDERMCP_OT_OpenTerms)
 
     print("BlenderMCP addon registered")
@@ -2795,6 +2903,7 @@ def unregister():
     bpy.utils.unregister_class(BLENDERMCP_OT_StartServer)
     bpy.utils.unregister_class(BLENDERMCP_OT_StopServer)
     bpy.utils.unregister_class(BLENDERMCP_OT_ImportCAD)
+    bpy.utils.unregister_class(BLENDERMCP_OT_ImportJSON3D)
     bpy.utils.unregister_class(BLENDERMCP_OT_OpenTerms)
     bpy.utils.unregister_class(BLENDERMCP_AddonPreferences)
 
